@@ -4,245 +4,581 @@ import type {
   Intent,
   Scene,
 } from "./types"
+
 import { INTENT_LABELS } from "./registry"
+
+/**
+ * Normalize a user query for deterministic matching.
+ */
+function normalizeQuery(
+    query: string,
+): string {
+  return query
+      .toLowerCase()
+      .replace(/[?.,!]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+}
+
+/**
+ * Basic singular/plural-aware token match.
+ */
+function wordMatchesQuery(
+    word: string,
+    query: string,
+): boolean {
+  const normalizedWord = word
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "")
+
+  if (normalizedWord.length < 3) {
+    return false
+  }
+
+  if (query.includes(normalizedWord)) {
+    return true
+  }
+
+  if (
+      normalizedWord.endsWith("s") &&
+      normalizedWord.length > 3 &&
+      query.includes(
+          normalizedWord.slice(0, -1),
+      )
+  ) {
+    return true
+  }
+
+  if (
+      !normalizedWord.endsWith("s") &&
+      query.includes(`${normalizedWord}s`)
+  ) {
+    return true
+  }
+
+  return false
+}
+
+/**
+ * Score a text string against the normalized query.
+ */
+function scoreText(
+    text: string,
+    query: string,
+): number {
+  const words = text
+      .toLowerCase()
+      .split(/\s+/)
+      .map((word) =>
+          word.replace(/[^a-z0-9]/g, ""),
+      )
+      .filter(
+          (word) => word.length >= 3,
+      )
+
+  let score = 0
+
+  for (const word of words) {
+    if (
+        wordMatchesQuery(
+            word,
+            query,
+        )
+    ) {
+      score += 1
+    }
+  }
+
+  return score
+}
+
+/**
+ * Score an EvidenceStore fact against a query.
+ *
+ * Keywords are more important than the natural-language
+ * question field because they are deliberately authored
+ * for retrieval.
+ */
+function scoreFact(
+    fact: {
+      q: string
+      a: string
+      keywords: string[]
+    },
+    query: string,
+): number {
+  let score = 0
+
+  for (const keyword of fact.keywords) {
+    const normalizedKeyword =
+        keyword.toLowerCase()
+
+    if (
+        query.includes(
+            normalizedKeyword,
+        )
+    ) {
+      score += 2
+    } else if (
+        normalizedKeyword.includes(
+            query,
+        ) &&
+        query.length >= 4
+    ) {
+      score += 1
+    }
+  }
+
+  score += scoreText(
+      fact.q,
+      query,
+  )
+
+  return score
+}
+
+/**
+ * Score a scene region against the query.
+ */
+function scoreRegion(
+    region: {
+      label: string
+      synonyms: string[]
+    },
+    query: string,
+): number {
+  let score = 0
+
+  if (
+      query.includes(
+          region.label.toLowerCase(),
+      )
+  ) {
+    score += 4
+  }
+
+  for (const synonym of region.synonyms) {
+    const normalized =
+        synonym.toLowerCase()
+
+    if (
+        query.includes(normalized)
+    ) {
+      score += 2
+    }
+  }
+
+  score += scoreText(
+      region.label,
+      query,
+  )
+
+  return score
+}
+
+/**
+ * Score an object against the query.
+ */
+function scoreObject(
+    object: {
+      label: string
+      note?: string
+    },
+    query: string,
+): number {
+  let score = 0
+
+  if (
+      query.includes(
+          object.label.toLowerCase(),
+      )
+  ) {
+    score += 4
+  }
+
+  score += scoreText(
+      object.label,
+      query,
+  )
+
+  if (object.note) {
+    score += scoreText(
+        object.note,
+        query,
+    )
+  }
+
+  return score
+}
 
 /**
  * Evidence retrieval.
  *
- * Given a scene, an intent and the query, retrieve the most relevant
- * ground-truth evidence from the scene's EvidenceStore.
+ * The EvidenceStore remains authoritative for curated
+ * quantitative facts.
  *
- * IMPORTANT:
- * The EvidenceStore remains authoritative for curated quantitative facts,
- * while the AI model is also allowed to inspect the actual imagery during
- * synthesis.
+ * The actual satellite imagery is supplied separately to
+ * the synthesis model for visual reasoning.
  */
 export function retrieveCitations(
     scene: Scene,
     intent: Intent,
     query: string,
 ): Citation[] {
-  const q = query.toLowerCase()
+  const q = normalizeQuery(query)
+
   const ev = scene.evidence
+
   const cites: Citation[] = []
 
   const targetBefore =
-      scene.mode === "bitemporal" ? ("before" as const) : undefined
+      scene.mode === "bitemporal"
+          ? ("before" as const)
+          : undefined
 
   const targetAfter =
-      scene.mode === "bitemporal" ? ("after" as const) : undefined
+      scene.mode === "bitemporal"
+          ? ("after" as const)
+          : undefined
 
   const opticalTarget =
-      scene.mode === "pair" ? ("optical" as const) : undefined
+      scene.mode === "pair"
+          ? ("optical" as const)
+          : undefined
 
-  /**
-   * Scene Captioning
-   */
+  // ---------------------------------------------------------------------------
+  // CAPTION
+  // ---------------------------------------------------------------------------
+
   if (intent === "caption") {
     cites.push({
       id: "cap",
       kind: "caption",
       label: "Scene caption",
       detail: ev.caption,
-      target: targetAfter ?? opticalTarget,
+      target:
+          targetAfter ??
+          opticalTarget,
     })
 
-    ev.landCover.slice(0, 3).forEach((lc, i) => {
-      cites.push({
-        id: `lc-${i}`,
-        kind: "landcover",
-        label: lc.class,
-        detail: `${lc.percent}% of scene`,
-        target: targetAfter ?? opticalTarget,
-      })
-    })
+    ev.landCover
+        .slice(0, 3)
+        .forEach((landCover, index) => {
+          cites.push({
+            id: `lc-${index}`,
+            kind: "landcover",
+            label: landCover.class,
+            detail: `${landCover.percent}% of scene`,
+            target:
+                targetAfter ??
+                opticalTarget,
+          })
+        })
   }
 
-  /**
-   * Visual Question Answering
-   */
+  // ---------------------------------------------------------------------------
+  // VQA
+  // ---------------------------------------------------------------------------
+
   if (intent === "vqa") {
-    // Normalize the query so matching is consistent.
-    const normalizedQuery = q
-        .replace(/[?.,!]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
+    const rankedFacts =
+        [...ev.facts]
+            .map((fact) => ({
+              fact,
+              score: scoreFact(
+                  fact,
+                  q,
+              ),
+            }))
+            .sort(
+                (a, b) =>
+                    b.score - a.score,
+            )
+
+    const chosenFacts =
+        rankedFacts[0]?.score
+            ? rankedFacts
+                .filter(
+                    (item) =>
+                        item.score > 0,
+                )
+                .slice(0, 2)
+            : rankedFacts.slice(0, 1)
+
+    chosenFacts.forEach(
+        (item, index) => {
+          cites.push({
+            id: `fact-${index}`,
+            kind: "caption",
+            label: "Fact",
+            detail: item.fact.a,
+            target: opticalTarget,
+          })
+        },
+    )
 
     /**
-     * Rank factual evidence by keyword overlap with the user's query.
-     */
-    const ranked = [...ev.facts]
-        .map((f) => ({
-          f,
-          score: f.keywords.reduce(
-              (s, k) =>
-                  normalizedQuery.includes(k.toLowerCase()) ? s + 1 : s,
-              0,
-          ),
-        }))
-        .sort((a, b) => b.score - a.score)
-
-    const chosen = ranked[0]?.score
-        ? ranked.filter((r) => r.score > 0).slice(0, 2)
-        : ranked.slice(0, 1)
-
-    chosen.forEach((r, i) => {
-      cites.push({
-        id: `fact-${i}`,
-        kind: "caption",
-        label: "Fact",
-        detail: r.f.a,
-        target: opticalTarget,
-      })
-    })
-
-    /**
-     * Attach ONLY objects explicitly relevant to the user's question.
-     *
      * IMPORTANT:
-     * The old implementation contained:
      *
-     *   || Boolean(ranked[0]?.score)
+     * Only objects that actually match the question
+     * are retrieved.
      *
-     * That meant that if ANY fact matched, unrelated objects were also
-     * attached. For example:
-     *
-     *   "Is there a bridge?"
-     *
-     * could retrieve both:
-     *
-     *   Road bridge
-     *   Moored vessel
-     *
-     * even though the user never asked about vessels.
-     *
-     * We now match object labels and notes directly against the query.
+     * The old implementation could attach every object
+     * whenever ANY fact matched.
      */
-    const matchedObjects = ev.objects.filter((o) => {
-      const label = o.label.toLowerCase()
-      const note = (o.note ?? "").toLowerCase()
+    const matchedObjects =
+        ev.objects
+            .map((object) => ({
+              object,
+              score: scoreObject(
+                  object,
+                  q,
+              ),
+            }))
+            .filter(
+                (item) =>
+                    item.score > 0,
+            )
+            .sort(
+                (a, b) =>
+                    b.score - a.score,
+            )
 
-      /**
-       * Words from the object's label.
-       *
-       * Example:
-       *   "Road bridge"
-       * becomes:
-       *   ["road", "bridge"]
-       */
-      const labelWords = label
-          .split(/\s+/)
-          .map((word) => word.replace(/[^a-z0-9]/g, ""))
-          .filter((word) => word.length >= 3)
+    matchedObjects
+        .slice(0, 2)
+        .forEach(
+            (item, index) => {
+              const object =
+                  item.object
 
-      /**
-       * Direct label matching.
-       *
-       * "bridge" matches "Road bridge".
-       */
-      const labelMatch = labelWords.some((word) => {
-        if (normalizedQuery.includes(word)) {
-          return true
-        }
+              cites.push({
+                id: `obj-${index}`,
+                kind: "object",
+                label: object.label,
+                detail:
+                    object.note ??
+                    `count: ${object.count}`,
 
-        /**
-         * Basic singular/plural matching.
-         *
-         * "ship" ↔ "ships"
-         * "vessel" ↔ "vessels"
-         */
-        if (
-            word.endsWith("s") &&
-            word.length > 3 &&
-            normalizedQuery.includes(word.slice(0, -1))
-        ) {
-          return true
-        }
+                bbox: object.bbox,
 
-        if (
-            !word.endsWith("s") &&
-            normalizedQuery.includes(`${word}s`)
-        ) {
-          return true
-        }
+                /**
+                 * CRITICAL FIX:
+                 *
+                 * Preserve custom line/polygon geometry.
+                 */
+                overlay:
+                object.overlay,
 
-        return false
-      })
+                target:
+                opticalTarget,
+              })
+            },
+        )
+  }
 
-      /**
-       * Also check the object's descriptive note.
-       *
-       * This allows questions to match useful descriptive terms
-       * even when the exact label isn't present.
-       */
-      const noteWords = note
-          .split(/\s+/)
-          .map((word) => word.replace(/[^a-z0-9]/g, ""))
-          .filter((word) => word.length >= 4)
+  // ---------------------------------------------------------------------------
+  // GROUNDING
+  // ---------------------------------------------------------------------------
 
-      const noteMatch = noteWords.some((word) =>
-          normalizedQuery.includes(word),
-      )
+  if (intent === "grounding") {
+    /**
+     * First retrieve regions.
+     *
+     * Regions are ranked by direct relevance so that if
+     * the user asks:
+     *
+     *   "Show me the bridge..."
+     *
+     * the Road bridge citation is placed before a generic
+     * Harbor water body citation.
+     */
+    const rankedRegions =
+        ev.regions
+            .map((region) => ({
+              region,
+              score: scoreRegion(
+                  region,
+                  q,
+              ),
+            }))
+            .sort(
+                (a, b) =>
+                    b.score - a.score,
+            )
 
-      return labelMatch || noteMatch
-    })
+    const matchedRegions =
+        rankedRegions
+            .filter(
+                (item) =>
+                    item.score > 0,
+            )
+            .slice(0, 3)
 
     /**
-     * Only matched objects are added.
-     *
-     * If the question is about a bridge:
-     *
-     *   matchedObjects = [Road bridge]
-     *
-     * The vessel will NOT be added merely because another fact matched.
+     * If no region matches, retain the previous safe
+     * behavior of returning the most relevant authored
+     * region.
      */
-    matchedObjects.slice(0, 2).forEach((o, i) => {
-      cites.push({
-        id: `obj-${i}`,
-        kind: "object",
-        label: o.label,
-        detail: o.note ?? `count: ${o.count}`,
-        bbox: o.bbox,
-        target: opticalTarget,
-      })
-    })
+    const chosenRegions =
+        matchedRegions.length > 0
+            ? matchedRegions
+            : rankedRegions.slice(
+                0,
+                1,
+            )
+
+    chosenRegions.forEach(
+        (item, index) => {
+          const region =
+              item.region
+
+          cites.push({
+            id: `reg-${index}`,
+            kind: "region",
+            label: region.label,
+            detail:
+                region.note ??
+                "Localized region",
+
+            bbox: region.bbox,
+
+            /**
+             * CRITICAL FIX:
+             *
+             * Preserve custom geometry.
+             *
+             * The Road bridge has a line overlay.
+             */
+            overlay:
+            region.overlay,
+
+            target:
+            opticalTarget,
+          })
+        },
+    )
+
+    /**
+     * Retrieve relevant quantitative facts too.
+     *
+     * This is important for questions such as:
+     *
+     * "Show me the bridge and estimate its length."
+     *
+     * The model needs the authored measurement evidence
+     * rather than inventing a number.
+     */
+    const rankedFacts =
+        [...ev.facts]
+            .map((fact) => ({
+              fact,
+              score: scoreFact(
+                  fact,
+                  q,
+              ),
+            }))
+            .sort(
+                (a, b) =>
+                    b.score - a.score,
+            )
+
+    const matchedFacts =
+        rankedFacts
+            .filter(
+                (item) =>
+                    item.score > 0,
+            )
+            .slice(0, 2)
+
+    matchedFacts.forEach(
+        (item, index) => {
+          cites.push({
+            id: `fact-${index}`,
+            kind: "caption",
+            label: "Fact",
+            detail: item.fact.a,
+            target: opticalTarget,
+          })
+        },
+    )
+
+    /**
+     * Also inspect explicitly detected objects.
+     *
+     * This helps grounding queries find an object when
+     * the region terminology is not an exact match.
+     */
+    const matchedObjects =
+        ev.objects
+            .map((object) => ({
+              object,
+              score: scoreObject(
+                  object,
+                  q,
+              ),
+            }))
+            .filter(
+                (item) =>
+                    item.score > 0,
+            )
+            .sort(
+                (a, b) =>
+                    b.score - a.score,
+            )
+
+    /**
+     * Only add an object if the corresponding region
+     * was not already retrieved.
+     */
+    const existingLabels =
+        new Set(
+            chosenRegions.map(
+                (item) =>
+                    item.region.label.toLowerCase(),
+            ),
+        )
+
+    matchedObjects
+        .filter(
+            (item) =>
+                !existingLabels.has(
+                    item.object.label.toLowerCase(),
+                ),
+        )
+        .slice(0, 2)
+        .forEach(
+            (item, index) => {
+              const object =
+                  item.object
+
+              cites.push({
+                id: `obj-${index}`,
+                kind: "object",
+                label: object.label,
+                detail:
+                    object.note ??
+                    `count: ${object.count}`,
+
+                bbox: object.bbox,
+
+                overlay:
+                object.overlay,
+
+                target:
+                opticalTarget,
+              })
+            },
+        )
   }
 
-  /**
-   * Object / Region Grounding
-   */
-  if (intent === "grounding") {
-    const ranked = [...ev.regions]
-        .map((r) => ({
-          r,
-          score: r.synonyms.reduce(
-              (s, k) =>
-                  q.includes(k.toLowerCase()) ? s + 1 : s,
-              0,
-          ),
-        }))
-        .sort((a, b) => b.score - a.score)
+  // ---------------------------------------------------------------------------
+  // CHANGE DETECTION
+  // ---------------------------------------------------------------------------
 
-    const chosen = ranked[0]?.score
-        ? ranked.filter((r) => r.score > 0)
-        : ranked.slice(0, 1)
-
-    chosen.slice(0, 3).forEach((r, i) => {
-      cites.push({
-        id: `reg-${i}`,
-        kind: "region",
-        label: r.r.label,
-        detail: r.r.note ?? "Localized region",
-        bbox: r.r.bbox,
-        target: opticalTarget,
-      })
-    })
-  }
-
-  /**
-   * Change Detection
-   */
-  if (intent === "change" && ev.changes) {
+  if (
+      intent === "change" &&
+      ev.changes
+  ) {
     cites.push({
       id: "cap",
       kind: "caption",
@@ -251,25 +587,33 @@ export function retrieveCitations(
       target: targetAfter,
     })
 
-    ev.changes.forEach((c, i) => {
-      cites.push({
-        id: `chg-${i}`,
-        kind: "change",
-        label: c.label,
-        detail: `${c.direction} · ${c.deltaPercent}% · ${c.note}`,
-        bbox: c.bbox,
-        target: targetAfter,
-      })
-    })
+    ev.changes.forEach(
+        (change, index) => {
+          cites.push({
+            id: `chg-${index}`,
+            kind: "change",
+            label: change.label,
+            detail:
+                `${change.direction} · ${change.deltaPercent}% · ${change.note}`,
 
-    // Retain targetBefore so TypeScript knows this is intentionally
-    // calculated for bitemporal scenes.
+            bbox: change.bbox,
+
+            overlay:
+            change.overlay,
+
+            target:
+            targetAfter,
+          })
+        },
+    )
+
     void targetBefore
   }
 
-  /**
-   * Multimodal / Optical + SAR Fusion
-   */
+  // ---------------------------------------------------------------------------
+  // FUSION
+  // ---------------------------------------------------------------------------
+
   if (intent === "fusion") {
     cites.push({
       id: "cap",
@@ -278,41 +622,54 @@ export function retrieveCitations(
       detail: ev.caption,
     })
 
-    ev.fusionNotes?.forEach((n, i) => {
-      cites.push({
-        id: `fus-${i}`,
-        kind: "fusion",
-        label: "Fusion insight",
-        detail: n,
-      })
-    })
+    ev.fusionNotes?.forEach(
+        (note, index) => {
+          cites.push({
+            id: `fus-${index}`,
+            kind: "fusion",
+            label: "Fusion insight",
+            detail: note,
+          })
+        },
+    )
 
-    ev.regions.slice(0, 2).forEach((r, i) => {
-      cites.push({
-        id: `freg-${i}`,
-        kind: "region",
-        label: r.label,
-        detail: "Cross-sensor region",
-        bbox: r.bbox,
-        target: "sar",
-      })
-    })
+    ev.regions
+        .slice(0, 2)
+        .forEach(
+            (region, index) => {
+              cites.push({
+                id: `freg-${index}`,
+                kind: "region",
+                label: region.label,
+                detail:
+                    "Cross-sensor region",
+
+                bbox: region.bbox,
+
+                overlay:
+                region.overlay,
+
+                target: "sar",
+              })
+            },
+        )
   }
 
   return cites
 }
 
+// -----------------------------------------------------------------------------
+// CONFIDENCE
+// -----------------------------------------------------------------------------
+
 /**
  * Confidence model.
  *
  * Combines:
- * - Scene-specific evidence baseline
- * - AI/heuristic classifier confidence
- * - Retrieved evidence density
- * - Modality compatibility
- *
- * This score represents confidence in the GROUNDED RESPONSE, not merely
- * confidence reported by the AI model.
+ * - scene-specific evidence baseline
+ * - classifier confidence
+ * - retrieved evidence density
+ * - modality compatibility
  */
 export function computeConfidence(
     scene: Scene,
@@ -322,23 +679,33 @@ export function computeConfidence(
     flags: string[],
 ): ConfidenceBreakdown {
   const base =
-      scene.evidence.baseConfidence[intent] ?? 0.6
+      scene.evidence
+          .baseConfidence[intent] ??
+      0.6
 
-  const evidenceStrength = Math.min(
-      1,
-      citationCount / 4,
-  )
+  const evidenceStrength =
+      Math.min(
+          1,
+          citationCount / 4,
+      )
 
   const modalityMatch =
-      (intent === "fusion" &&
-          scene.modality !== "optical+sar") ||
-      (intent === "change" &&
-          scene.mode !== "bitemporal")
+      (
+          intent === "fusion" &&
+          scene.modality !==
+          "optical+sar"
+      ) ||
+      (
+          intent === "change" &&
+          scene.mode !==
+          "bitemporal"
+      )
           ? 0.4
           : 1
 
   const retrievedSupport =
-      0.4 + evidenceStrength * 0.6
+      0.4 +
+      evidenceStrength * 0.6
 
   const components = [
     {
@@ -347,20 +714,30 @@ export function computeConfidence(
       note:
           "Curated ground-truth strength for this scene/task",
     },
+
     {
       label: "Intent certainty",
-      value: round(classifierConfidence),
+      value: round(
+          classifierConfidence,
+      ),
       note:
           "Router's confidence in the chosen specialist",
     },
+
     {
       label: "Retrieved support",
-      value: round(retrievedSupport),
-      note: `${citationCount} grounding citation(s)`,
+      value: round(
+          retrievedSupport,
+      ),
+      note:
+          `${citationCount} grounding citation(s)`,
     },
+
     {
       label: "Modality fit",
-      value: round(modalityMatch),
+      value: round(
+          modalityMatch,
+      ),
       note:
           modalityMatch < 1
               ? "Requested capability is weak for this scene"
@@ -370,26 +747,37 @@ export function computeConfidence(
 
   const overall = round(
       base * 0.4 +
-      classifierConfidence * 0.25 +
+      classifierConfidence *
+      0.25 +
       retrievedSupport * 0.2 +
       modalityMatch * 0.15,
   )
 
   const caveats: string[] = []
 
-  if (scene.provenance.synthetic) {
+  if (
+      scene.provenance.synthetic
+  ) {
     caveats.push(
         "Imagery is a synthetic demonstration asset — not a calibrated product.",
     )
   }
 
-  if (flags.includes("change-needs-bitemporal")) {
+  if (
+      flags.includes(
+          "change-needs-bitemporal",
+      )
+  ) {
     caveats.push(
         "Change requested on a non-bitemporal scene; answer is limited to a single epoch.",
     )
   }
 
-  if (flags.includes("fusion-needs-sar")) {
+  if (
+      flags.includes(
+          "fusion-needs-sar",
+      )
+  ) {
     caveats.push(
         "Fusion requested but no SAR channel is available for this scene.",
     )
@@ -414,31 +802,43 @@ export function computeConfidence(
   }
 }
 
-function round(n: number): number {
+function round(
+    value: number,
+): number {
   return (
       Math.round(
-          Math.max(0, Math.min(1, n)) * 100,
+          Math.max(
+              0,
+              Math.min(
+                  1,
+                  value,
+              ),
+          ) * 100,
       ) / 100
   )
 }
 
+// -----------------------------------------------------------------------------
+// OFFLINE FALLBACK
+// -----------------------------------------------------------------------------
+
 /**
- * Deterministic grounded answer used when both model providers are
- * unavailable.
- *
- * This remains intentionally offline and deterministic so the SIH demo
- * continues to function even if an external provider is unavailable.
+ * Deterministic grounded answer used only when both
+ * external model providers are unavailable.
  */
 export function composeOfflineAnswer(
     scene: Scene,
     intent: Intent,
     citations: Citation[],
 ): string {
-  const label = INTENT_LABELS[intent]
+  const label =
+      INTENT_LABELS[intent]
 
-  const lines = citations.map(
-      (c) => `• ${c.label}: ${c.detail}`,
-  )
+  const lines =
+      citations.map(
+          (citation) =>
+              `• ${citation.label}: ${citation.detail}`,
+      )
 
   return [
     `**${label}** — grounded summary for *${scene.title}*:`,
@@ -449,19 +849,20 @@ export function composeOfflineAnswer(
   ].join("\n")
 }
 
+// -----------------------------------------------------------------------------
+// SYNTHESIS PROMPT
+// -----------------------------------------------------------------------------
+
 /**
  * Builds the multimodal synthesis prompt.
  *
  * The model receives:
  *
- *   1. The user's question
+ *   1. User question
  *   2. Retrieved EvidenceStore citations
- *   3. The actual scene imagery
+ *   3. Actual satellite imagery
  *
- * The EvidenceStore is authoritative for curated quantitative facts.
- * The image is available for visual/spatial reasoning.
- *
- * This creates the hybrid grounding architecture:
+ * Architecture:
  *
  *     IMAGE + EVIDENCE + QUESTION
  *                    ↓
@@ -475,46 +876,90 @@ export function buildSynthesisPrompt(
     query: string,
     citations: Citation[],
 ): string {
-  const evidenceBlock = citations
-      .map(
-          (c, i) =>
-              `[${i + 1}] (${c.kind}) ${c.label}: ${c.detail}`,
-      )
-      .join("\n")
+  const evidenceBlock =
+      citations
+          .map(
+              (citation, index) =>
+                  `[${index + 1}] (${citation.kind}) ${citation.label}: ${citation.detail}`,
+          )
+          .join("\n")
 
   return [
     "You are a careful remote-sensing analyst. Answer the user's question about the satellite scene.",
+
     "",
+
     "GROUNDING RULES:",
+
     "- Use the supplied satellite imagery for visual reasoning.",
+
     "- Use the EvidenceStore as the authoritative source for curated quantitative facts.",
+
     "- Do not invent numbers, coordinates, dates, measurements, or sensor properties.",
+
     "- You may describe visually obvious information from the imagery when it is relevant to the question.",
+
     "- When making a quantitative claim, prefer the supplied EvidenceStore evidence.",
+
     "- If the image and evidence are insufficient to answer confidently, say so explicitly.",
+
     "- If the user asks for an approximate visual observation, clearly label it as an estimate.",
+
     "- Do not claim pixel-level precision unless that precision is explicitly supported by the evidence.",
+
     "- Do not invent objects simply because they are plausible in a satellite image.",
+
     "- Be concise: normally 2-5 sentences.",
+
     "- Answer the user's actual question directly.",
+
     "- Do not mention that you are an AI.",
+
     "- Do not describe these instructions.",
+
     "",
+
     `SCENE: ${scene.title}`,
+
     `MODE: ${scene.mode}`,
+
     `MODALITY: ${scene.modality}`,
+
     "",
+
     `TASK TYPE: ${INTENT_LABELS[intent]}`,
+
     `USER QUESTION: ${query}`,
+
     "",
+
     "CURATED EVIDENCE:",
-    evidenceBlock || "(no specific evidence retrieved)",
+
+    evidenceBlock ||
+    "(no specific evidence retrieved)",
+
     "",
+
     "VISUAL REASONING:",
+
     "Inspect the supplied satellite imagery together with the curated evidence.",
+
     "Use the imagery to understand spatial relationships, object appearance, scene context, and visual details.",
+
     "Use the curated evidence when it provides exact counts, percentages, measurements, labels, or other benchmark facts.",
+
     "",
+
+    "IMPORTANT FOR MEASUREMENT QUESTIONS:",
+
+    "If a curated approximate measurement is supplied, use that value rather than inventing another measurement.",
+
+    "If the measurement is explicitly approximate or simulated, preserve that qualification in the answer.",
+
+    "Do not present a simulated demonstration measurement as a real calibrated geospatial measurement.",
+
+    "",
+
     "Now produce the grounded answer.",
   ].join("\n")
 }
