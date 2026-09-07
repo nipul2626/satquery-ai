@@ -1,279 +1,625 @@
 import { generateText } from "ai"
+
 import { getScene } from "@/lib/scenes"
-import { PRIMARY, FALLBACK } from "@/lib/ai"
+
 import {
-  retrieveCitations,
-  buildSynthesisPrompt,
+    PRIMARY,
+    FALLBACK,
+    parseQueryPlan,
+} from "@/lib/ai"
+
+import {
+    retrieveCitations,
+    formatCitationsForModel,
+    buildSynthesisPrompt,
 } from "@/lib/retrieval"
-import { getSceneImageParts } from "@/lib/vision"
-import type { Intent } from "@/lib/types"
+
+import {
+    getSceneImageParts,
+    VisualAnalysisSchema,
+    buildVisualAnalysisInstructions,
+    normalizeVisualAnalysis,
+    visualAnalysisToCitations,
+} from "@/lib/vision"
+
+import type {
+    Citation,
+    Intent,
+    SynthesisResponse,
+    VisualAnalysisResult,
+} from "@/lib/types"
 
 export const runtime = "nodejs"
-export const maxDuration = 60
+export const maxDuration = 90
 
-/**
- * Remove reasoning that Qwen may expose as <think>...</think>.
- *
- * The user should only see the final answer.
- */
-function cleanModelOutput(text: string): string {
-  let cleaned = text.trim()
-
-  // Remove complete reasoning blocks.
-  cleaned = cleaned.replace(
-      /<think>[\s\S]*?<\/think>/gi,
-      "",
-  )
-
-  // Remove an unmatched opening reasoning block.
-  cleaned = cleaned.replace(
-      /<think>[\s\S]*$/gi,
-      "",
-  )
-
-  // Remove an unmatched closing tag.
-  cleaned = cleaned.replace(
-      /<\/think>/gi,
-      "",
-  )
-
-  // Remove accidental markdown fences.
-  cleaned = cleaned
-      .replace(/^```(?:text|markdown)?\s*/i, "")
-      .replace(/\s*```$/i, "")
-      .trim()
-
-  return cleaned
-}
-
-export async function POST(req: Request) {
-  const {
-    sceneId,
-    query,
-    intent,
-  } = (await req.json()) as {
+type RequestBody = {
     sceneId?: string
     query?: string
     intent?: Intent
-  }
+}
 
-  const scene = sceneId
-      ? getScene(sceneId)
-      : undefined
+type VisionContentPart =
+    | {
+    type: "text"
+    text: string
+}
+    | {
+    type: "file"
+    data: Buffer
+    mediaType: string
+}
 
-  if (!scene || !query || !intent) {
-    return new Response("Invalid request", {
-      status: 400,
-    })
-  }
+function jsonResponse(
+    payload: SynthesisResponse,
+    status = 200,
+): Response {
+    return new Response(
+        JSON.stringify(payload),
+        {
+            status,
+            headers: {
+                "content-type": "application/json; charset=utf-8",
+                "x-satquery-provider": payload.provider,
+                "cache-control": "no-cache, no-store",
+            },
+        },
+    )
+}
 
-  // -------------------------------------------------------------------------
-  // EVIDENCE
-  // -------------------------------------------------------------------------
+function mergeCitations(
+    visionCitations: Citation[],
+    evidenceCitations: Citation[],
+): Citation[] {
+    const seen = new Set<string>()
+    const merged: Citation[] = []
 
-  const citations = retrieveCitations(
-      scene,
-      intent,
-      query,
-  )
+    for (const citation of [
+        ...visionCitations,
+        ...evidenceCitations,
+    ]) {
+        if (seen.has(citation.id)) {
+            continue
+        }
 
-  const prompt = buildSynthesisPrompt(
-      scene,
-      intent,
-      query,
-      citations,
-  )
+        seen.add(citation.id)
+        merged.push(citation)
+    }
 
-  // -------------------------------------------------------------------------
-  // ACTUAL SATELLITE IMAGERY
-  // -------------------------------------------------------------------------
+    return merged
+}
 
-  const imageParts = await getSceneImageParts(scene)
+// -----------------------------------------------------------------------------
+// JSON EXTRACTION
+// -----------------------------------------------------------------------------
 
-  console.log(
-      `[satquery] image parts available: ${imageParts.length}`,
-  )
+function extractJsonObject(text: string): unknown {
+    const cleaned = text
+        .trim()
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```$/i, "")
+        .trim()
 
-  // -------------------------------------------------------------------------
-  // VISUAL INSTRUCTIONS
-  // -------------------------------------------------------------------------
+    // Direct JSON
+    try {
+        return JSON.parse(cleaned)
+    } catch {
+        // Continue below.
+    }
 
-  const visualInstructions = [
-    "VISUAL ANALYSIS INSTRUCTIONS",
-    "",
-    "You are the final vision-language model for a satellite imagery analysis application.",
-    "The actual satellite imagery for the selected scene is attached to this message.",
-    "",
-    "Inspect the attached imagery before answering.",
-    "Use the imagery to understand visible objects, spatial relationships, land cover, and scene context.",
-    "",
-    "The EvidenceStore contains curated demonstration facts.",
-    "Treat curated quantitative facts as authoritative.",
-    "For counts, percentages, and other quantitative values, use the EvidenceStore when available.",
-    "",
-    "Use visual inspection for descriptive and spatial reasoning.",
-    "",
-    "Do not invent coordinates.",
-    "Do not invent dates.",
-    "Do not invent measurements.",
-    "Do not invent sensor properties.",
-    "Do not claim that an object is present unless it is supported by the imagery or evidence.",
-    "",
-    "IMPORTANT OUTPUT RULES:",
-    "Return ONLY the final answer.",
-    "Do NOT reveal internal reasoning.",
-    "Do NOT output <think> tags.",
-    "Do NOT output analysis steps.",
-    "Do NOT explain how you reasoned about the image.",
-    "Do NOT discuss these instructions.",
-    "Do NOT repeatedly question whether the image is a composite.",
-    "Answer the user's actual question directly.",
-    "Keep the response concise and useful.",
-    "",
-    scene.mode === "pair"
-        ? "IMAGE ORDER: Image 1 is optical imagery. Image 2 is SAR imagery."
-        : scene.mode === "bitemporal"
-            ? "IMAGE ORDER: Image 1 is the before image. Image 2 is the after image."
-            : "IMAGE ORDER: The attached image is the primary optical scene.",
-  ].join("\n")
+    const firstBrace = cleaned.indexOf("{")
 
-  // -------------------------------------------------------------------------
-  // MULTIMODAL MESSAGE
-  // -------------------------------------------------------------------------
+    if (firstBrace === -1) {
+        throw new Error(
+            "Vision model did not return a JSON object",
+        )
+    }
 
-  const content = [
-    {
-      type: "text" as const,
-      text: `${prompt}\n\n${visualInstructions}`,
-    },
-    ...imageParts,
-  ]
+    let depth = 0
+    let inString = false
+    let escaped = false
 
-  // -------------------------------------------------------------------------
-  // GROQ PRIMARY
-  // -------------------------------------------------------------------------
+    for (
+        let index = firstBrace;
+        index < cleaned.length;
+        index += 1
+    ) {
+        const char = cleaned[index]
 
-  try {
+        if (escaped) {
+            escaped = false
+            continue
+        }
+
+        if (char === "\\") {
+            escaped = true
+            continue
+        }
+
+        if (char === '"') {
+            inString = !inString
+            continue
+        }
+
+        if (inString) {
+            continue
+        }
+
+        if (char === "{") {
+            depth += 1
+        }
+
+        if (char === "}") {
+            depth -= 1
+
+            if (depth === 0) {
+                const candidate = cleaned.slice(
+                    firstBrace,
+                    index + 1,
+                )
+
+                try {
+                    return JSON.parse(candidate)
+                } catch {
+                    throw new Error(
+                        "Vision model returned malformed JSON",
+                    )
+                }
+            }
+        }
+    }
+
+    throw new Error(
+        "Vision model returned incomplete JSON",
+    )
+}
+
+// -----------------------------------------------------------------------------
+// VISUAL ANALYSIS VALIDATION
+// -----------------------------------------------------------------------------
+
+function validateVisualAnalysis(
+    raw: unknown,
+): VisualAnalysisResult {
+    const parsed =
+        VisualAnalysisSchema.safeParse(raw)
+
+    if (!parsed.success) {
+        const details =
+            parsed.error.issues
+                .slice(0, 8)
+                .map(
+                    (issue) =>
+                        `${issue.path.join(".")}: ${issue.message}`,
+                )
+                .join("; ")
+
+        throw new Error(
+            `Vision JSON failed local validation: ${details}`,
+        )
+    }
+
+    return normalizeVisualAnalysis(
+        parsed.data,
+    )
+}
+
+// -----------------------------------------------------------------------------
+// GROQ VISION
+// -----------------------------------------------------------------------------
+
+async function runGroqVision(
+    content: VisionContentPart[],
+): Promise<VisualAnalysisResult> {
     console.log(
-        `[satquery] calling ${PRIMARY.label}`,
+        "[satquery] Groq: Qwen 3.6 Vision + JSON Object Mode",
+    )
+
+    /*
+     * IMPORTANT:
+     *
+     * Do NOT use Output.object() here.
+     *
+     * Qwen 3.6 is being used in JSON Object Mode.
+     * The JSON is parsed locally and validated with Zod.
+     *
+     * 700 tokens keeps us safely below the current
+     * Groq organization OTPM limit of 1000.
+     */
+    const result = await generateText({
+        model: PRIMARY.model,
+
+        providerOptions: {
+            groq: {
+                structuredOutputs: false,
+                reasoningFormat: "hidden",
+                reasoningEffort: "none",
+            },
+        },
+
+        messages: [
+            {
+                role: "user",
+                content,
+            },
+        ],
+
+        maxOutputTokens: 950,
+
+        temperature: 0,
+
+        maxRetries: 0,
+    })
+
+    const text = result.text?.trim()
+
+    if (!text) {
+        throw new Error(
+            "Groq returned an empty response",
+        )
+    }
+
+    const raw = extractJsonObject(text)
+
+    return validateVisualAnalysis(raw)
+}
+
+// -----------------------------------------------------------------------------
+// GEMINI VISION
+// -----------------------------------------------------------------------------
+
+async function runGeminiVision(
+    content: VisionContentPart[],
+): Promise<VisualAnalysisResult> {
+    console.log(
+        "[satquery] Gemini: plain JSON response + local validation",
     )
 
     const result = await generateText({
-      model: PRIMARY.model,
+        model: FALLBACK.model,
 
-      messages: [
-        {
-          role: "user",
-          content,
-        },
-      ],
+        messages: [
+            {
+                role: "user",
+                content,
+            },
+        ],
 
-      maxOutputTokens: 500,
-      temperature: 0.2,
+        maxOutputTokens: 950,
+        temperature: 0,
+
+        maxRetries: 0,
     })
 
-    const answer = cleanModelOutput(
-        result.text,
-    )
+    const text = result.text?.trim()
 
-    console.log(
-        `[satquery] Groq returned ${answer.length} characters`,
-    )
-
-    if (!answer) {
-      throw new Error(
-          "Groq returned an empty answer",
-      )
+    if (!text) {
+        throw new Error(
+            "Gemini returned an empty response",
+        )
     }
 
-    return new Response(answer, {
-      status: 200,
-      headers: {
-        "content-type":
-            "text/plain; charset=utf-8",
+    const raw = extractJsonObject(text)
 
-        "x-satquery-provider": "groq",
+    return validateVisualAnalysis(raw)
+}
 
-        "cache-control": "no-cache",
-      },
-    })
-  } catch (error) {
-    console.error(
-        "[satquery] Groq vision synthesis failed:",
-        error instanceof Error
-            ? error.message
-            : error,
-    )
-  }
+// -----------------------------------------------------------------------------
+// MAIN ROUTE
+// -----------------------------------------------------------------------------
 
-  // -------------------------------------------------------------------------
-  // GEMINI FALLBACK
-  // -------------------------------------------------------------------------
+export async function POST(
+    req: Request,
+) {
+    try {
+        const {
+            sceneId,
+            query,
+            intent,
+        } = (await req.json()) as RequestBody
 
-  try {
-    console.log(
-        `[satquery] calling ${FALLBACK.label}`,
-    )
+        const scene = sceneId
+            ? getScene(sceneId)
+            : undefined
 
-    const result = await generateText({
-      model: FALLBACK.model,
+        if (
+            !scene ||
+            !query ||
+            !intent
+        ) {
+            return new Response(
+                "Invalid request",
+                {
+                    status: 400,
+                },
+            )
+        }
 
-      messages: [
-        {
-          role: "user",
-          content,
-        },
-      ],
+        // ---------------------------------------------------------------------
+        // QUERY PLANNING
+        // ---------------------------------------------------------------------
 
-      maxOutputTokens: 500,
-      temperature: 0.2,
-    })
+        const plan = parseQueryPlan(
+            query,
+            scene,
+        )
 
-    const answer = cleanModelOutput(
-        result.text,
-    )
+        console.log(
+            "[satquery] query plan:",
+            plan,
+        )
 
-    console.log(
-        `[satquery] Gemini returned ${answer.length} characters`,
-    )
+        // ---------------------------------------------------------------------
+        // EVIDENCE RETRIEVAL
+        // ---------------------------------------------------------------------
 
-    if (!answer) {
-      throw new Error(
-          "Gemini returned an empty answer",
-      )
+        const citations =
+            retrieveCitations(
+                scene,
+                intent,
+                query,
+                plan,
+            )
+
+        const evidenceText =
+            formatCitationsForModel(
+                citations,
+            )
+
+        // ---------------------------------------------------------------------
+        // LOAD ACTUAL SCENE IMAGE
+        // ---------------------------------------------------------------------
+
+        const imageParts =
+            await getSceneImageParts(
+                scene,
+            )
+
+        console.log(
+            `[satquery] visual analysis: ${imageParts.length} image part(s)`,
+        )
+
+        if (!imageParts.length) {
+            console.error(
+                "[satquery] no scene image could be loaded",
+            )
+        }
+
+        // ---------------------------------------------------------------------
+        // MODEL PROMPT
+        // ---------------------------------------------------------------------
+
+        const baseContext =
+            buildSynthesisPrompt(
+                scene,
+                intent,
+                query,
+                citations,
+            )
+
+        const instructions =
+            buildVisualAnalysisInstructions(
+                scene,
+                query,
+                plan,
+                evidenceText,
+            )
+
+        /*
+         * Add a very explicit compact-output instruction.
+         *
+         * This is important because your previous Groq response contained
+         * only part of the required schema.
+         */
+        const compactJsonInstruction = `
+OUTPUT REQUIREMENT:
+
+Return exactly ONE complete JSON object.
+
+Do not return markdown.
+Do not return explanations outside the JSON.
+Do not omit any required field.
+Do not stop early.
+
+The JSON must contain ALL of these top-level fields:
+
+{
+  "answer": "string",
+  "findings": [],
+  "rankedCandidates": [],
+  "selectedFindingId": "string or null",
+  "measurement": {
+    "requested": "string",
+    "value": "number or null",
+    "unit": "string or null",
+    "status": "evidence or visual-estimate or unsupported",
+    "confidence": 0,
+    "caveat": "string or null"
+  },
+  "observations": [],
+  "confidence": 0
+}
+
+Keep the response compact.
+
+For a simple counting question, return only the findings needed to support the count.
+For a simple yes/no question, return only the relevant finding.
+For a ranking question, return only the candidates needed for the ranking.
+For grounding, include bounding boxes or points for the objects you actually identify.
+
+Never invent coordinates.
+Never invent measurements that cannot be visually supported.
+Use null where a value is not applicable.
+`
+
+        const content: VisionContentPart[] = [
+            {
+                type: "text",
+                text: [
+                    baseContext,
+                    "",
+                    instructions,
+                    "",
+                    compactJsonInstruction,
+                ].join("\n"),
+            },
+            ...imageParts,
+        ]
+
+        // ---------------------------------------------------------------------
+        // PRIMARY: GROQ
+        // ---------------------------------------------------------------------
+
+        try {
+            if (!imageParts.length) {
+                throw new Error(
+                    "Cannot perform vision analysis without scene imagery",
+                )
+            }
+
+            const visual =
+                await runGroqVision(
+                    content,
+                )
+
+            const visionCitations =
+                visualAnalysisToCitations(
+                    visual,
+                )
+
+            const merged =
+                mergeCitations(
+                    visionCitations,
+                    citations,
+                )
+
+            if (!visual.answer.trim()) {
+                throw new Error(
+                    "Groq returned an empty visual answer",
+                )
+            }
+
+            console.log(
+                `[satquery] Groq vision succeeded: ${visionCitations.length} visual finding(s)`,
+            )
+
+            return jsonResponse({
+                ok: true,
+                provider: "groq",
+                answer: visual.answer,
+                citations: merged,
+                visualAnalysis: visual,
+                confidence: visual.confidence,
+            })
+        } catch (error) {
+            console.error(
+                "[satquery] Groq vision failed:",
+                error instanceof Error
+                    ? error.message
+                    : error,
+            )
+        }
+
+        // ---------------------------------------------------------------------
+        // FALLBACK: GEMINI
+        // ---------------------------------------------------------------------
+
+        try {
+            if (!imageParts.length) {
+                throw new Error(
+                    "Cannot perform vision analysis without scene imagery",
+                )
+            }
+
+            const visual =
+                await runGeminiVision(
+                    content,
+                )
+
+            const visionCitations =
+                visualAnalysisToCitations(
+                    visual,
+                )
+
+            const merged =
+                mergeCitations(
+                    visionCitations,
+                    citations,
+                )
+
+            if (!visual.answer.trim()) {
+                throw new Error(
+                    "Gemini returned an empty visual answer",
+                )
+            }
+
+            console.log(
+                `[satquery] Gemini vision succeeded: ${visionCitations.length} visual finding(s)`,
+            )
+
+            return jsonResponse({
+                ok: true,
+                provider: "gemini",
+                answer: visual.answer,
+                citations: merged,
+                visualAnalysis: visual,
+                confidence: visual.confidence,
+            })
+        } catch (error) {
+            console.error(
+                "[satquery] Gemini vision failed:",
+                error instanceof Error
+                    ? error.message
+                    : error,
+            )
+        }
+
+        // ---------------------------------------------------------------------
+        // OFFLINE FALLBACK
+        // ---------------------------------------------------------------------
+
+        const offlineAnswer =
+            citations.length
+                ? [
+                    "The external vision providers could not complete the visual analysis.",
+                    "",
+                    ...citations.map(
+                        (citation) =>
+                            `• ${citation.label}: ${citation.detail}`,
+                    ),
+                ].join("\n")
+                : "The external vision providers could not complete the visual analysis, and no curated evidence matched this query."
+
+        console.warn(
+            "[satquery] both vision providers failed; using offline evidence fallback",
+        )
+
+        return jsonResponse({
+            ok: false,
+            provider: "offline",
+            answer: offlineAnswer,
+            citations,
+            visualAnalysis: null,
+            confidence: 0,
+        })
+    } catch (error) {
+        console.error(
+            "[satquery] synthesize route error:",
+            error instanceof Error
+                ? error.message
+                : error,
+        )
+
+        return new Response(
+            JSON.stringify({
+                error: "Synthesis failed",
+            }),
+            {
+                status: 500,
+                headers: {
+                    "content-type":
+                        "application/json; charset=utf-8",
+                },
+            },
+        )
     }
-
-    return new Response(answer, {
-      status: 200,
-      headers: {
-        "content-type":
-            "text/plain; charset=utf-8",
-
-        "x-satquery-provider": "gemini",
-
-        "cache-control": "no-cache",
-      },
-    })
-  } catch (error) {
-    console.error(
-        "[satquery] Gemini vision synthesis failed:",
-        error instanceof Error
-            ? error.message
-            : error,
-    )
-  }
-
-  // -------------------------------------------------------------------------
-  // OFFLINE FALLBACK
-  // -------------------------------------------------------------------------
-
-  return new Response("", {
-    status: 200,
-    headers: {
-      "content-type":
-          "text/plain; charset=utf-8",
-
-      "x-satquery-provider": "offline",
-    },
-  })
 }
