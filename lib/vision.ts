@@ -148,6 +148,9 @@ const findingSchema = z.object({
     ]),
     confidence: z.number().min(0).max(1),
     selected: z.boolean(),
+    groundingConfidence: z.number().min(0).max(1).optional(),
+    groundingStatus: z.enum(["verified", "uncertain", "rejected"]).optional(),
+    geometrySource: z.enum(["vision", "grounding-refinement"]).optional(),
 })
 
 const candidateSchema = z.object({
@@ -170,6 +173,9 @@ const candidateSchema = z.object({
         "both",
     ]),
     confidence: z.number().min(0).max(1),
+    groundingConfidence: z.number().min(0).max(1).optional(),
+    groundingStatus: z.enum(["verified", "uncertain", "rejected"]).optional(),
+    geometrySource: z.enum(["vision", "grounding-refinement"]).optional(),
 })
 
 const measurementSchema = z.object({
@@ -207,6 +213,27 @@ export const VisualAnalysisSchema = z.object({
 
 export type VisualAnalysisModelOutput =
     z.infer<typeof VisualAnalysisSchema>
+
+const groundingTargetSchema = z.object({
+    id: z.string(),
+    visible: z.boolean(),
+    geometryType: z.enum([
+        "point",
+        "bbox",
+        "line",
+        "polygon",
+    ]),
+    bbox: bboxSchema.nullable(),
+    points: z.array(pointSchema).max(32),
+    confidence: z.number().min(0).max(1),
+})
+
+export const GroundingVerificationSchema = z.object({
+    targets: z.array(groundingTargetSchema).max(8),
+    overallConfidence: z.number().min(0).max(1),
+})
+
+export type GroundingVerificationResult = z.infer<typeof GroundingVerificationSchema>
 
 // -----------------------------------------------------------------------------
 // MODEL INSTRUCTIONS
@@ -330,16 +357,22 @@ export function buildVisualAnalysisInstructions(
         groundingTask
             ? [
                 "GROUNDING IS REQUIRED.",
-                "Return geometry for the exact requested target(s).",
-                "For a compact object such as a ship, vehicle, building, or crater, use a TIGHT bounding box around the visible object.",
-                "For an elongated feature such as a bridge, road, river segment, runway, or shoreline, prefer a line or polygon that follows the visible feature.",
-                "For an irregular region such as floodwater, a lake, shadowed terrain, or a settlement, use a polygon when its boundary can be traced reliably.",
-                "Use a point only when a point is more faithful than an area or line.",
+                "Localization is a separate task from semantic recognition: knowing what an object is is NOT enough; the geometry must land on the actual visible pixels of that object.",
+                "Before returning coordinates, re-inspect the image and mentally verify that the proposed point, box, line, or polygon lies on the requested visual feature and not on nearby empty terrain.",
+                "Return geometry for the exact requested target(s), not for a nearby region or scene description.",
+                "For a compact object such as a ship, vehicle, building, aircraft, or crater, use a TIGHT bbox around the visible object body. The bbox should be only slightly larger than the object.",
+                "For an elongated feature such as a bridge, road, river segment, runway, or shoreline, prefer a line or narrow polygon that follows the visible feature itself.",
+                "For an irregular region such as floodwater, a lake, shadowed terrain, vegetation patch, or settlement, use a polygon following the visible boundary; do not use one giant rectangular scene region.",
+                "For a direct 'point to' request, include a point located INSIDE the target itself, ideally near its visual center. A point in surrounding water, road, terrain, or shadow is invalid.",
+                "For a bbox target, its center must also fall inside the target whenever the full target is visible.",
+                "For a line, points must trace the actual feature, not a parallel road, shoreline, wake, or shadow.",
+                "For a polygon, vertices must follow the target boundary in image order and remain inside the relevant visible region.",
                 "A bbox must enclose the target itself, not an arbitrary image quadrant or surrounding empty terrain.",
                 "Do not make a bbox huge merely because the target is partially uncertain.",
                 "If only part of a target is visible at the image edge, bound the visible portion and say that it is truncated.",
-                "Never use a generic center-of-image point as a substitute for localization.",
+                "Never use a generic center-of-image point, quadrant, or evidence-store bbox as a substitute for localization.",
                 "If the target cannot be localized confidently, return no geometry rather than guessing.",
+                "Prefer a slightly conservative tight geometry over a large uncertain geometry.",
             ].join("\n")
             : "Grounding is not explicitly required. Add geometry only when it materially supports the answer.",
         "",
@@ -437,10 +470,185 @@ export function buildVisualAnalysisInstructions(
         ),
         "",
         "Replace every example value with information from the actual imagery.",
+        "For every grounded target, mentally test the geometry: if the overlay were drawn on the image, would it visibly cover the requested object or region rather than nearby empty space? If not, revise it or return no geometry.",
+        "For point requests, the point must lie inside the object. For bbox requests, the box must tightly enclose the object. For line/polygon requests, every segment must follow the visible feature.",
         "If there is no selected visual target, selectedFindingId must be null.",
         "If measurement is not applicable, requested='none', value=null, unit=null, status='unsupported'.",
         "Keep JSON compact enough to finish completely. Completeness is more important than verbose descriptions.",
     ].join("\n")
+}
+
+// -----------------------------------------------------------------------------
+// SECOND-PASS GROUNDING VERIFICATION
+// -----------------------------------------------------------------------------
+
+export function buildGroundingVerificationInstructions(
+    scene: Scene,
+    query: string,
+    plan: {
+        operation: string
+        targetHint: string | null
+        ordinal: number | null
+        ranking: string | null
+    },
+    analysis: VisualAnalysisResult,
+): string {
+    const targets = [
+        ...analysis.findings.filter((finding) => finding.selected),
+        ...analysis.findings.filter((finding) => finding.id === analysis.selectedFindingId),
+        ...analysis.rankedCandidates.filter((candidate) => candidate.id === analysis.selectedFindingId),
+    ]
+        .filter((item, index, all) => all.findIndex((other) => other.id === item.id) === index)
+        .slice(0, 8)
+
+    return [
+        "You are SatQuery AI's grounding verification engine.",
+        "The first vision pass already decided WHAT the answer is. Your only job is to verify and correct WHERE the selected target is located in the supplied image.",
+        "Inspect the actual image pixels again. Do not trust the proposed coordinates merely because they came from another model pass.",
+        "A semantic description such as 'large cargo ship' is not a valid location. The final geometry must land directly on the visible target.",
+        "If the proposed geometry is wrong, replace it with corrected geometry. If the target is not confidently visible, set visible=false and return empty geometry.",
+        "Coordinates are normalized 0..1 relative to the full supplied image: x left-to-right, y top-to-bottom.",
+        "For point requests, place the point inside the target, preferably near its visual center.",
+        "For compact objects, use a tight bbox around the visible object body; exclude wakes, shadows, roads, water, and surrounding empty space.",
+        "For elongated features, use a line or narrow polygon following the feature.",
+        "For irregular affected regions, use a polygon following the visible region rather than a giant rectangle.",
+        "For ranking, verify that the selected candidate's geometry belongs to the selected candidate, not another candidate nearby.",
+        "Do not use EvidenceStore geometry as the final location unless the image independently confirms the same feature.",
+        "Return exactly one JSON object and nothing else.",
+        "USER REQUEST:",
+        query,
+        "QUERY PLAN:",
+        JSON.stringify(plan),
+        `SCENE: ${scene.title}`,
+        "TARGETS TO VERIFY:",
+        JSON.stringify(targets.map((target) => ({
+            id: target.id,
+            label: target.label,
+            geometryType: target.geometryType,
+            bbox: target.bbox,
+            points: target.points,
+        }))),
+        "RETURN SHAPE:",
+        JSON.stringify({
+            targets: [
+                {
+                    id: "target-id",
+                    visible: true,
+                    geometryType: "bbox",
+                    bbox: { x: 0.1, y: 0.1, w: 0.1, h: 0.1 },
+                    points: [],
+                    confidence: 0.9,
+                },
+            ],
+            overallConfidence: 0.9,
+        }, null, 2),
+        "Return one target entry for every target above.",
+        "Never invent coordinates. Verify them against the actual pixels.",
+    ].join("\n")
+}
+
+export function normalizeGroundingVerification(
+    raw: GroundingVerificationResult,
+): GroundingVerificationResult {
+    return {
+        targets: raw.targets.map((target) => ({
+            ...target,
+            id: target.id.trim(),
+            bbox: target.bbox ? normalizeBBox(target.bbox) : null,
+            points: normalizePoints(target.points),
+            confidence: clamp01(target.confidence),
+        })),
+        overallConfidence: clamp01(raw.overallConfidence),
+    }
+}
+
+export function applyGroundingVerification(
+    analysis: VisualAnalysisResult,
+    verification: GroundingVerificationResult,
+): VisualAnalysisResult {
+    const verified = normalizeGroundingVerification(verification)
+    const byId = new Map(verified.targets.map((target) => [target.id, target]))
+
+    const applyTo = <T extends {
+        id: string
+        geometryType: VisualFinding["geometryType"]
+        bbox: BBox | null
+        points: { x: number; y: number }[]
+        confidence: number
+    }>(item: T): T => {
+        const target = byId.get(item.id)
+        if (!target) return item
+
+        if (!target.visible || target.confidence < 0.55) {
+            return {
+                ...item,
+                bbox: null,
+                points: [],
+                groundingConfidence: target.confidence,
+                groundingStatus: "rejected",
+                geometrySource: "grounding-refinement",
+            } as T
+        }
+
+        const hasEnoughGeometry =
+            target.geometryType === "point"
+                ? target.points.length >= 1
+                : target.geometryType === "line"
+                    ? target.points.length >= 2
+                    : target.geometryType === "polygon"
+                        ? target.points.length >= 3
+                        : Boolean(target.bbox)
+
+        if (!hasEnoughGeometry) {
+            return {
+                ...item,
+                bbox: null,
+                points: [],
+                groundingConfidence: target.confidence,
+                groundingStatus: "uncertain",
+                geometrySource: "grounding-refinement",
+            } as T
+        }
+
+        return {
+            ...item,
+            geometryType: target.geometryType,
+            bbox: target.bbox,
+            points: target.points,
+            groundingConfidence: target.confidence,
+            groundingStatus: "verified",
+            geometrySource: "grounding-refinement",
+        } as T
+    }
+
+    const findings = analysis.findings.map((finding) => applyTo(finding))
+    const rankedCandidates = analysis.rankedCandidates.map((candidate) => applyTo(candidate))
+
+    const selectedStillGrounded =
+        analysis.selectedFindingId === null ||
+        findings.some((finding) =>
+            finding.id === analysis.selectedFindingId &&
+            (finding.bbox !== null || finding.points.length > 0),
+        ) ||
+        rankedCandidates.some((candidate) =>
+            candidate.id === analysis.selectedFindingId &&
+            (candidate.bbox !== null || candidate.points.length > 0),
+        )
+
+    return {
+        ...analysis,
+        findings,
+        rankedCandidates,
+        selectedFindingId: selectedStillGrounded
+            ? analysis.selectedFindingId
+            : null,
+        confidence: Math.round(
+            clamp01(
+                analysis.confidence * 0.45 +
+                verified.overallConfidence * 0.55,
+            ) * 100,
+        ) / 100,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -489,8 +697,11 @@ export function visualAnalysisToCitations(
             detail: [
                 isSelected ? "AI-selected visual target" : "AI visual finding",
                 `${Math.round(finding.confidence * 100)}% visual confidence`,
+                finding.groundingConfidence !== undefined
+                    ? `${Math.round(finding.groundingConfidence * 100)}% grounding confidence`
+                    : null,
                 finding.description,
-            ].join(" · "),
+            ].filter(Boolean).join(" · "),
             bbox: clampBBox(bbox),
             overlay: geometry ?? undefined,
             target: finding.target === "both" ? "both" : finding.target,
@@ -512,9 +723,16 @@ export function visualAnalysisToCitations(
         )
 
         if (selectedCandidate) {
+            const geometry = normalizeGeometry(
+                selectedCandidate.geometryType,
+                selectedCandidate.points,
+                selectedCandidate.bbox,
+            )
+
             const bbox = selectedCandidate.bbox
                 ? normalizeBBox(selectedCandidate.bbox)
-                : pointsToBBox(normalizePoints(selectedCandidate.points))
+                : geometryToBBox(geometry) ??
+                pointsToBBox(normalizePoints(selectedCandidate.points))
 
             if (bbox) {
                 const baseId = `vision-${slugify(selectedCandidate.id || selectedCandidate.label)}`
@@ -530,6 +748,7 @@ export function visualAnalysisToCitations(
                         `${Math.round(selectedCandidate.confidence * 100)}% visual confidence`,
                     ].join(" · "),
                     bbox: clampBBox(bbox),
+                    overlay: geometry ?? undefined,
                     target:
                         selectedCandidate.target === "both"
                             ? "both"
