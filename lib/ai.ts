@@ -325,7 +325,12 @@ function extractTargetHint(
   const actionMatch = q.match(
       /\b(?:show|point to|point at|locate|find|identify|mark|highlight|delineate|outline|where is|where are|circle|trace|detect)\s+(?:the|a|an|any)?\s*(.+?)(?:\s+(?:in|inside|within|near|around|and|then|with|what|how|tell|give)\b|$)/i,
   )
-  if (actionMatch?.[1]) return cleanTarget(actionMatch[1])
+  if (actionMatch?.[1]) {
+    const target = cleanTarget(actionMatch[1])
+    if (target && !/^(it|this|that|them|those|these)$/i.test(target)) {
+      return target
+    }
+  }
 
   const nounMatch = q.match(
       /\b(craters?|ships?|vessels?|boats?|bridges?|roads?|rivers?|lakes?|water bodies?|buildings?|vehicles?|aircraft|runways?|fields?|settlements?|houses?|trees?|forest|flood(?:ed|ing)? areas?|ice|shadow(?:ed)? regions?|basins?|channels?|shorelines?|coastlines?|islands?|mountains?|hills?|towers?|structures?|urban areas?)\b/i,
