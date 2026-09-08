@@ -49,6 +49,30 @@ type VisionContentPart =
     mediaType: string
 }
 
+// -----------------------------------------------------------------------------
+// GROQ RATE-LIMIT PROTECTION
+// -----------------------------------------------------------------------------
+//
+// Groq applies organization-level input-token-per-minute limits.
+//
+// Qwen 3.6 vision requests can be large because every attached image contributes
+// vision input tokens. Two-image scenes such as flood before/after or optical/SAR
+// can therefore hit the ITPM limit much faster than simple text requests.
+//
+// We keep a short local cooldown after a rate-limit response so repeated demo
+// queries don't continuously hammer Groq while the same rate-limit window is
+// active.
+//
+
+let groqRateLimitedUntil = 0
+
+const GROQ_RATE_LIMIT_COOLDOWN_MS = 15_000
+const GROQ_RATE_LIMIT_RETRY_MS = 11_000
+
+// -----------------------------------------------------------------------------
+// RESPONSE HELPER
+// -----------------------------------------------------------------------------
+
 function jsonResponse(
     payload: SynthesisResponse,
     status = 200,
@@ -58,13 +82,36 @@ function jsonResponse(
         {
             status,
             headers: {
-                "content-type": "application/json; charset=utf-8",
-                "x-satquery-provider": payload.provider,
-                "cache-control": "no-cache, no-store",
+                "content-type":
+                    "application/json; charset=utf-8",
+                "x-satquery-provider":
+                payload.provider,
+                "cache-control":
+                    "no-cache, no-store",
             },
         },
     )
 }
+
+// -----------------------------------------------------------------------------
+// SMALL ASYNC WAIT HELPER
+// -----------------------------------------------------------------------------
+
+function wait(
+    milliseconds: number,
+): Promise<void> {
+    return new Promise(
+        (resolve) =>
+            setTimeout(
+                resolve,
+                milliseconds,
+            ),
+    )
+}
+
+// -----------------------------------------------------------------------------
+// CITATION MERGING
+// -----------------------------------------------------------------------------
 
 function mergeCitations(
     visionCitations: Citation[],
@@ -89,14 +136,39 @@ function mergeCitations(
 }
 
 // -----------------------------------------------------------------------------
+// ERROR CLASSIFICATION
+// -----------------------------------------------------------------------------
+
+function isGroqRateLimitError(
+    error: unknown,
+): boolean {
+    const message =
+        error instanceof Error
+            ? error.message
+            : String(error)
+
+    return /rate limit|429|ITPM|tokens per minute|too many requests/i.test(
+        message,
+    )
+}
+
+// -----------------------------------------------------------------------------
 // JSON EXTRACTION
 // -----------------------------------------------------------------------------
 
-function extractJsonObject(text: string): unknown {
+function extractJsonObject(
+    text: string,
+): unknown {
     const cleaned = text
         .trim()
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/\s*```$/i, "")
+        .replace(
+            /^```(?:json)?\s*/i,
+            "",
+        )
+        .replace(
+            /\s*```$/i,
+            "",
+        )
         .trim()
 
     // Direct JSON
@@ -106,7 +178,8 @@ function extractJsonObject(text: string): unknown {
         // Continue below.
     }
 
-    const firstBrace = cleaned.indexOf("{")
+    const firstBrace =
+        cleaned.indexOf("{")
 
     if (firstBrace === -1) {
         throw new Error(
@@ -123,7 +196,8 @@ function extractJsonObject(text: string): unknown {
         index < cleaned.length;
         index += 1
     ) {
-        const char = cleaned[index]
+        const char =
+            cleaned[index]
 
         if (escaped) {
             escaped = false
@@ -152,13 +226,16 @@ function extractJsonObject(text: string): unknown {
             depth -= 1
 
             if (depth === 0) {
-                const candidate = cleaned.slice(
-                    firstBrace,
-                    index + 1,
-                )
+                const candidate =
+                    cleaned.slice(
+                        firstBrace,
+                        index + 1,
+                    )
 
                 try {
-                    return JSON.parse(candidate)
+                    return JSON.parse(
+                        candidate,
+                    )
                 } catch {
                     throw new Error(
                         "Vision model returned malformed JSON",
@@ -206,6 +283,15 @@ function validateVisualAnalysis(
 // -----------------------------------------------------------------------------
 // GROQ VISION
 // -----------------------------------------------------------------------------
+//
+// Qwen 3.6 supports vision + JSON Object Mode.
+//
+// We intentionally do NOT use Output.object() here.
+// The JSON is parsed locally and validated with Zod.
+//
+// 950 output tokens keeps us below the current Groq organization OTPM limit
+// of 1000 while still giving ranking/comparison questions enough room.
+//
 
 async function runGroqVision(
     content: VisionContentPart[],
@@ -214,17 +300,6 @@ async function runGroqVision(
         "[satquery] Groq: Qwen 3.6 Vision + JSON Object Mode",
     )
 
-    /*
-     * IMPORTANT:
-     *
-     * Do NOT use Output.object() here.
-     *
-     * Qwen 3.6 is being used in JSON Object Mode.
-     * The JSON is parsed locally and validated with Zod.
-     *
-     * 700 tokens keeps us safely below the current
-     * Groq organization OTPM limit of 1000.
-     */
     const result = await generateText({
         model: PRIMARY.model,
 
@@ -250,7 +325,8 @@ async function runGroqVision(
         maxRetries: 0,
     })
 
-    const text = result.text?.trim()
+    const text =
+        result.text?.trim()
 
     if (!text) {
         throw new Error(
@@ -258,7 +334,8 @@ async function runGroqVision(
         )
     }
 
-    const raw = extractJsonObject(text)
+    const raw =
+        extractJsonObject(text)
 
     return validateVisualAnalysis(raw)
 }
@@ -266,6 +343,10 @@ async function runGroqVision(
 // -----------------------------------------------------------------------------
 // GEMINI VISION
 // -----------------------------------------------------------------------------
+//
+// Gemini is deliberately handled without provider-side schema enforcement.
+// We ask for JSON in the prompt and validate the returned text ourselves.
+//
 
 async function runGeminiVision(
     content: VisionContentPart[],
@@ -285,12 +366,14 @@ async function runGeminiVision(
         ],
 
         maxOutputTokens: 950,
+
         temperature: 0,
 
         maxRetries: 0,
     })
 
-    const text = result.text?.trim()
+    const text =
+        result.text?.trim()
 
     if (!text) {
         throw new Error(
@@ -298,7 +381,8 @@ async function runGeminiVision(
         )
     }
 
-    const raw = extractJsonObject(text)
+    const raw =
+        extractJsonObject(text)
 
     return validateVisualAnalysis(raw)
 }
@@ -360,10 +444,21 @@ export async function POST(
                 plan,
             )
 
+        /*
+         * IMPORTANT:
+         *
+         * The EvidenceStore is supporting context.
+         * The actual satellite pixels remain the primary source for visual
+         * discovery, grounding, ranking, and comparison.
+         *
+         * We intentionally cap the amount of evidence sent to the vision model.
+         * This reduces Groq input-token pressure, especially for two-image
+         * scenes such as flood before/after and optical/SAR pairs.
+         */
         const evidenceText =
             formatCitationsForModel(
                 citations,
-            )
+            ).slice(0, 3000)
 
         // ---------------------------------------------------------------------
         // LOAD ACTUAL SCENE IMAGE
@@ -388,13 +483,21 @@ export async function POST(
         // MODEL PROMPT
         // ---------------------------------------------------------------------
 
+        /*
+         * buildSynthesisPrompt contains useful scene context, but sending a
+         * very large text payload together with two vision images can push the
+         * request over Groq's organization ITPM limit.
+         *
+         * Keep the useful beginning of the context while preventing accidental
+         * prompt bloat.
+         */
         const baseContext =
             buildSynthesisPrompt(
                 scene,
                 intent,
                 query,
                 citations,
-            )
+            ).slice(0, 4000)
 
         const instructions =
             buildVisualAnalysisInstructions(
@@ -407,8 +510,8 @@ export async function POST(
         /*
          * Add a very explicit compact-output instruction.
          *
-         * This is important because your previous Groq response contained
-         * only part of the required schema.
+         * This is important because previous vision responses occasionally
+         * returned only part of the required schema.
          */
         const compactJsonInstruction = `
 OUTPUT REQUIREMENT:
@@ -476,10 +579,81 @@ Use null where a value is not applicable.
                 )
             }
 
-            const visual =
-                await runGroqVision(
-                    content,
+            /*
+             * If Groq was recently rate-limited, don't immediately hammer the
+             * same organization-level limit again.
+             *
+             * Gemini will be used as the fallback during this cooldown.
+             */
+            if (
+                Date.now() <
+                groqRateLimitedUntil
+            ) {
+                throw new Error(
+                    "Groq temporarily rate-limited; using Gemini fallback",
                 )
+            }
+
+            let visual: VisualAnalysisResult
+
+            try {
+                visual =
+                    await runGroqVision(
+                        content,
+                    )
+            } catch (error) {
+                /*
+                 * Groq's error often contains a recommended wait time.
+                 *
+                 * Give it one short retry after the current minute window has
+                 * had time to release tokens. We only do this for actual rate
+                 * limits; validation/model errors go directly to Gemini.
+                 */
+                if (
+                    !isGroqRateLimitError(
+                        error,
+                    )
+                ) {
+                    throw error
+                }
+
+                groqRateLimitedUntil =
+                    Date.now() +
+                    GROQ_RATE_LIMIT_COOLDOWN_MS
+
+                console.warn(
+                    "[satquery] Groq rate-limited; waiting briefly before retry",
+                )
+
+                await wait(
+                    GROQ_RATE_LIMIT_RETRY_MS,
+                )
+
+                /*
+                 * The cooldown may have expired naturally while waiting.
+                 * If another concurrent request already extended it, skip the
+                 * second call and fall through to Gemini.
+                 */
+                if (
+                    Date.now() <
+                    groqRateLimitedUntil
+                ) {
+                    throw new Error(
+                        "Groq rate limit still active; switching to Gemini",
+                    )
+                }
+
+                visual =
+                    await runGroqVision(
+                        content,
+                    )
+
+                /*
+                 * Successful Groq retry means the rate-limit condition has
+                 * cleared.
+                 */
+                groqRateLimitedUntil = 0
+            }
 
             const visionCitations =
                 visualAnalysisToCitations(
@@ -508,15 +682,33 @@ Use null where a value is not applicable.
                 answer: visual.answer,
                 citations: merged,
                 visualAnalysis: visual,
-                confidence: visual.confidence,
+                confidence:
+                visual.confidence,
             })
         } catch (error) {
-            console.error(
-                "[satquery] Groq vision failed:",
+            const message =
                 error instanceof Error
                     ? error.message
-                    : error,
-            )
+                    : String(error)
+
+            if (
+                isGroqRateLimitError(
+                    error,
+                )
+            ) {
+                groqRateLimitedUntil =
+                    Date.now() +
+                    GROQ_RATE_LIMIT_COOLDOWN_MS
+
+                console.warn(
+                    "[satquery] Groq rate-limited; temporarily switching to Gemini",
+                )
+            } else {
+                console.error(
+                    "[satquery] Groq vision failed:",
+                    message,
+                )
+            }
         }
 
         // ---------------------------------------------------------------------
@@ -562,7 +754,8 @@ Use null where a value is not applicable.
                 answer: visual.answer,
                 citations: merged,
                 visualAnalysis: visual,
-                confidence: visual.confidence,
+                confidence:
+                visual.confidence,
             })
         } catch (error) {
             console.error(
