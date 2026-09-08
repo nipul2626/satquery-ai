@@ -185,6 +185,10 @@ export type QueryPlan = {
   requiresCandidateSearch: boolean
 }
 
+export type GroundingStatus = "verified" | "uncertain" | "rejected"
+
+export type GeometrySource = "vision" | "grounding-refinement"
+
 export type VisualGeometryType =
     | "point"
     | "bbox"
@@ -206,6 +210,9 @@ export type VisualFinding = {
       | "both"
   confidence: number
   selected: boolean
+  groundingConfidence?: number
+  groundingStatus?: GroundingStatus
+  geometrySource?: GeometrySource
 }
 
 export type RankedCandidate = {
@@ -222,6 +229,9 @@ export type RankedCandidate = {
       | "after"
       | "both"
   confidence: number
+  groundingConfidence?: number
+  groundingStatus?: GroundingStatus
+  geometrySource?: GeometrySource
 }
 
 export type MeasurementResult = {
