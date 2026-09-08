@@ -622,37 +622,15 @@ Use null where a value is not applicable.
                     GROQ_RATE_LIMIT_COOLDOWN_MS
 
                 console.warn(
-                    "[satquery] Groq rate-limited; waiting briefly before retry",
+                    "[satquery] Groq rate-limited; switching directly to Gemini fallback",
                 )
 
-                await wait(
-                    GROQ_RATE_LIMIT_RETRY_MS,
+                // Do not retry immediately: the error is organization-level
+                // ITPM/OTPM throttling, so another vision request would only
+                // consume more quota and delay the response.
+                throw new Error(
+                    "Groq rate limit active; switching to Gemini",
                 )
-
-                /*
-                 * The cooldown may have expired naturally while waiting.
-                 * If another concurrent request already extended it, skip the
-                 * second call and fall through to Gemini.
-                 */
-                if (
-                    Date.now() <
-                    groqRateLimitedUntil
-                ) {
-                    throw new Error(
-                        "Groq rate limit still active; switching to Gemini",
-                    )
-                }
-
-                visual =
-                    await runGroqVision(
-                        content,
-                    )
-
-                /*
-                 * Successful Groq retry means the rate-limit condition has
-                 * cleared.
-                 */
-                groqRateLimitedUntil = 0
             }
 
             const visionCitations =
